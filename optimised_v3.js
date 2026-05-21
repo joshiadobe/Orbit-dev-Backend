@@ -26,6 +26,9 @@ app.use(express.json());
 const BASE_URL = process.env.FJ_BASE_URL || "https://api.fluffyjaws.adobe.com";
 const MODEL = process.env.FJ_MODEL || "gpt-5.4";
 const PORT = process.env.PORT || 3000;
+const OKTA_OIDC_ISSUER =
+  process.env.OKTA_OIDC_ISSUER ||
+  "https://adobe-stage.okta.com/oauth2";
 
 const OKTA_TOKEN_URL =
     process.env.OKTA_TOKEN_URL ||
@@ -208,7 +211,7 @@ app.post(
                 });
 
             const response = await fetch(
-                "https://adobe-stage.okta.com/oauth2/v1/token",
+                OKTA_OIDC_ISSUER + "/v1/token",
                 {
                     method: "POST",
 
@@ -293,7 +296,7 @@ app.post(
                 });
 
             const response = await fetch(
-                "https://adobe-stage.okta.com/oauth2/v1/token",
+                OKTA_OIDC_ISSUER + "/v1/token",
                 {
                     method: "POST",
 

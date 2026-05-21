@@ -57,8 +57,7 @@ const messageSchema = new Schema(
 
     expireAt: {
       type: Date,
-      required: true,
-      index: true
+      required: true
     }
   },
   {

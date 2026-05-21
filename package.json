@@ -1,0 +1,21 @@
+{
+  "name": "orbit-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "optimised_v3.js",
+  "scripts": {
+    "start": "node optimised_v3.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "mongoose": "^9.6.2",
+    "openid-client": "^6.8.4"
+  }
+}

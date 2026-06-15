@@ -2,20 +2,22 @@ import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 import connectDB from "./db.js";
+import crypto from "crypto";
+import conversationService from "./services/conversation-service.js";
 
 dotenv.config();
 
 const app = express();
 
 app.use(function addHeaders(req, res, next) {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-User-Token"
-  );
-  res.header("Access-Control-Allow-Private-Network", "true");
-  next();
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.header(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, X-User-Token"
+    );
+    res.header("Access-Control-Allow-Private-Network", "true");
+    next();
 });
 
 app.use(cors({ origin: true }));
@@ -23,569 +25,949 @@ app.use(express.json());
 
 const BASE_URL = process.env.FJ_BASE_URL || "https://api.fluffyjaws.adobe.com";
 const MODEL = process.env.FJ_MODEL || "gpt-5.4";
-// const PORT = process.env.PORT || 3000;
-const PORT = 3001;
+const PORT = process.env.PORT || 3000;
+const OKTA_OIDC_ISSUER =
+  process.env.OKTA_OIDC_ISSUER ||
+  "https://adobe-stage.okta.com/oauth2";
 
 const OKTA_TOKEN_URL =
-  process.env.OKTA_TOKEN_URL ||
-  "https://adobe.okta.com/oauth2/aus1gan31wnmCPyB60h8/v1/token";
+    process.env.OKTA_TOKEN_URL ||
+    "https://adobe.okta.com/oauth2/aus1gan31wnmCPyB60h8/v1/token";
 const OKTA_CLIENT_ID = process.env.OKTA_CLIENT_ID || "";
 const OKTA_CLIENT_SECRET = process.env.OKTA_CLIENT_SECRET || "";
 
 let serviceTokenCache = {
-  accessToken: null,
-  expiresAt: 0
+    accessToken: null,
+    expiresAt: 0
 };
 
 let serviceTokenInFlight = null;
 
 app.options("/chat", function optionsChat(req, res) {
-  res.sendStatus(200);
+    res.sendStatus(200);
 });
 
+function parseJwt(token) {
+    try {
+        return JSON.parse(
+            Buffer.from(
+                token.split(".")[1],
+                "base64"
+            ).toString("utf8")
+        );
+    } catch (err) {
+        return null;
+    }
+}
+
 function parseSSE(chunk, bufferObj) {
-  bufferObj.buffer += chunk;
-  const events = [];
+    bufferObj.buffer += chunk;
+    const events = [];
 
-  while (bufferObj.buffer.includes("\n\n")) {
-    const parts = bufferObj.buffer.split("\n\n");
-    const block = parts.shift();
-    bufferObj.buffer = parts.join("\n\n");
+    while (bufferObj.buffer.includes("\n\n")) {
+        const parts = bufferObj.buffer.split("\n\n");
+        const block = parts.shift();
+        bufferObj.buffer = parts.join("\n\n");
 
-    const dataParts = [];
+        const dataParts = [];
 
-    block.split("\n").forEach(function parseLine(line) {
-      if (line.startsWith("data:")) {
-        dataParts.push(line.replace("data:", "").trim());
-      }
-    });
+        block.split("\n").forEach(function parseLine(line) {
+            if (line.startsWith("data:")) {
+                dataParts.push(line.replace("data:", "").trim());
+            }
+        });
 
-    if (dataParts.length) {
-      events.push(dataParts.join("\n"));
+        if (dataParts.length) {
+            events.push(dataParts.join("\n"));
+        }
     }
-  }
 
-  return events;
+    return events;
 }
 
-function normalizeHistory(history) {
-  if (!Array.isArray(history)) {
-    return [];
-  }
 
-  const normalized = [];
-
-  for (let i = 0; i < history.length; i += 1) {
-    const item = history[i];
-
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    const role = item.role === "assistant" ? "assistant" : item.role === "user" ? "user" : null;
-    const content = typeof item.content === "string" ? item.content.trim() : "";
-
-    if (!role || !content) {
-      continue;
-    }
-
-    normalized.push({
-      role: role,
-      content: content
-    });
-  }
-
-  return normalized;
-}
-
-function buildMessages(prompt, history, previousResponseId, fresh) {
-  const cleanPrompt = typeof prompt === "string" ? prompt.trim() : "";
-  const cleanHistory = normalizeHistory(history);
-
-  if (fresh) {
-    return [
-      {
-        role: "user",
-        content: cleanPrompt
-      }
-    ];
-  }
-
-  if (previousResponseId) {
-    return [
-      {
-        role: "user",
-        content: cleanPrompt
-      }
-    ];
-  }
-
-  if (cleanHistory.length > 0) {
-    return cleanHistory.concat([
-      {
-        role: "user",
-        content: cleanPrompt
-      }
-    ]);
-  }
-
-  return [
-    {
-      role: "user",
-      content: cleanPrompt
-    }
-  ];
-}
 
 async function getServiceToken() {
-  const now = Date.now();
+    const now = Date.now();
 
-  if (
-    serviceTokenCache.accessToken &&
-    now < serviceTokenCache.expiresAt - 60 * 1000
-  ) {
-    return serviceTokenCache.accessToken;
-  }
-
-  if (serviceTokenInFlight) {
-    return serviceTokenInFlight;
-  }
-
-  serviceTokenInFlight = (async () => {
-    if (!OKTA_CLIENT_ID || !OKTA_CLIENT_SECRET) {
-      throw new Error("Missing OKTA_CLIENT_ID or OKTA_CLIENT_SECRET");
+    if (
+        serviceTokenCache.accessToken &&
+        now < serviceTokenCache.expiresAt - 60 * 1000
+    ) {
+        return serviceTokenCache.accessToken;
     }
 
-    const body = new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: OKTA_CLIENT_ID,
-      client_secret: OKTA_CLIENT_SECRET,
-      scope: "fluffyjaws"
-    });
-
-    const response = await fetch(OKTA_TOKEN_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json"
-      },
-      body: body.toString()
-    });
-
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(
-        data.error_description ||
-        data.error ||
-        "Failed to obtain service token"
-      );
+    if (serviceTokenInFlight) {
+        return serviceTokenInFlight;
     }
 
-    if (!data.access_token) {
-      throw new Error("Service token response missing access_token");
+    serviceTokenInFlight = (async () => {
+        if (!OKTA_CLIENT_ID || !OKTA_CLIENT_SECRET) {
+            throw new Error("Missing OKTA_CLIENT_ID or OKTA_CLIENT_SECRET");
+        }
+
+        const body = new URLSearchParams({
+            grant_type: "client_credentials",
+            client_id: OKTA_CLIENT_ID,
+            client_secret: OKTA_CLIENT_SECRET,
+            scope: "fluffyjaws"
+        });
+
+        const response = await fetch(OKTA_TOKEN_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                Accept: "application/json"
+            },
+            body: body.toString()
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(
+                data.error_description ||
+                data.error ||
+                "Failed to obtain service token"
+            );
+        }
+
+        if (!data.access_token) {
+            throw new Error("Service token response missing access_token");
+        }
+
+        const expiresIn = Number(data.expires_in || 3600);
+
+        serviceTokenCache = {
+            accessToken: data.access_token,
+            expiresAt: Date.now() + Math.max(expiresIn - 60, 60) * 1000
+        };
+
+        return serviceTokenCache.accessToken;
+    })();
+
+    try {
+        return await serviceTokenInFlight;
+    } finally {
+        serviceTokenInFlight = null;
     }
-
-    const expiresIn = Number(data.expires_in || 3600);
-
-    serviceTokenCache = {
-      accessToken: data.access_token,
-      expiresAt: Date.now() + Math.max(expiresIn - 60, 60) * 1000
-    };
-
-    return serviceTokenCache.accessToken;
-  })();
-
-  try {
-    return await serviceTokenInFlight;
-  } finally {
-    serviceTokenInFlight = null;
-  }
 }
 
 app.post(
-  "/auth/exchange",
+    "/auth/exchange",
 
-  async function authExchangeHandler(
+    async function authExchangeHandler(
+        req,
+        res
+    ) {
+        try {
+            const code =
+                req.body && req.body.code
+                    ? req.body.code
+                    : null;
+
+            const codeVerifier =
+                req.body &&
+                    req.body.codeVerifier
+                    ? req.body.codeVerifier
+                    : null;
+
+            const redirectUri =
+                req.body &&
+                    req.body.redirectUri
+                    ? req.body.redirectUri
+                    : null;
+
+            if (
+                !code ||
+                !codeVerifier ||
+                !redirectUri
+            ) {
+                return res
+                    .status(400)
+                    .json({
+                        error:
+                            "Missing PKCE parameters"
+                    });
+            }
+
+            const body =
+                new URLSearchParams({
+                    grant_type:
+                        "authorization_code",
+
+                    client_id:
+                        process.env
+                            .OKTA_NATIVE_CLIENT_ID,
+
+                    redirect_uri:
+                        redirectUri,
+
+                    code:
+                        code,
+
+                    code_verifier:
+                        codeVerifier
+                });
+
+            const response = await fetch(
+                OKTA_OIDC_ISSUER + "/v1/token",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/x-www-form-urlencoded",
+
+                        Accept:
+                            "application/json"
+                    },
+
+                    body: body.toString()
+                }
+            );
+
+            const data =
+                await response.json();
+
+            if (!response.ok) {
+                return res
+                    .status(response.status)
+                    .json({
+                        error:
+                            data.error_description ||
+                            data.error ||
+                            "Token exchange failed"
+                    });
+            }
+
+            return res.json(data);
+
+        } catch (err) {
+            console.error(
+                "PKCE exchange failed:",
+                err
+            );
+
+            return res
+                .status(500)
+                .json({
+                    error:
+                        "PKCE exchange failed"
+                });
+        }
+    }
+);
+
+app.post(
+    "/auth/refresh",
+
+    async function authRefreshHandler(
+        req,
+        res
+    ) {
+        try {
+            const refreshToken =
+                req.body &&
+                    req.body.refreshToken
+                    ? req.body.refreshToken
+                    : null;
+
+            if (!refreshToken) {
+                return res
+                    .status(400)
+                    .json({
+                        error:
+                            "Missing refresh token"
+                    });
+            }
+
+            const body =
+                new URLSearchParams({
+                    grant_type:
+                        "refresh_token",
+
+                    client_id:
+                        process.env
+                            .OKTA_NATIVE_CLIENT_ID,
+
+                    refresh_token:
+                        refreshToken
+                });
+
+            const response = await fetch(
+                OKTA_OIDC_ISSUER + "/v1/token",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/x-www-form-urlencoded",
+
+                        Accept:
+                            "application/json"
+                    },
+
+                    body: body.toString()
+                }
+            );
+
+            const data =
+                await response.json();
+
+            if (!response.ok) {
+                return res
+                    .status(response.status)
+                    .json({
+                        error:
+                            data.error_description ||
+                            data.error ||
+                            "Refresh failed"
+                    });
+            }
+
+            return res.json(data);
+
+        } catch (err) {
+            console.error(
+                "Refresh flow failed:",
+                err
+            );
+
+            return res
+                .status(500)
+                .json({
+                    error:
+                        "Refresh flow failed"
+                });
+        }
+    }
+);
+
+app.post(
+  "/conversation/recent",
+
+  async function recentConversationHandler(
     req,
     res
   ) {
     try {
-      const code =
-        req.body && req.body.code
-          ? req.body.code
-          : null;
 
-      const codeVerifier =
+      const caseId =
         req.body &&
-        req.body.codeVerifier
-          ? req.body.codeVerifier
-          : null;
+        req.body.caseId
+          ? String(req.body.caseId).trim()
+          : "";
 
-      const redirectUri =
+      const userToken =
         req.body &&
-        req.body.redirectUri
-          ? req.body.redirectUri
+        req.body.userToken
+          ? req.body.userToken
           : null;
 
-      if (
-        !code ||
-        !codeVerifier ||
-        !redirectUri
-      ) {
-        return res
-          .status(400)
-          .json({
-            error:
-              "Missing PKCE parameters"
-          });
-      }
-
-      const body =
-        new URLSearchParams({
-          grant_type:
-            "authorization_code",
-
-          client_id:
-            process.env
-              .OKTA_NATIVE_CLIENT_ID,
-
-          redirect_uri:
-            redirectUri,
-
-          code:
-            code,
-
-          code_verifier:
-            codeVerifier
+      if (!caseId) {
+        return res.status(400).json({
+          error: "caseId required"
         });
-
-      const response = await fetch(
-        "https://adobe-stage.okta.com/oauth2/v1/token",
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/x-www-form-urlencoded",
-
-            Accept:
-              "application/json"
-          },
-
-          body: body.toString()
-        }
-      );
-
-      const data =
-        await response.json();
-
-      if (!response.ok) {
-        return res
-          .status(response.status)
-          .json({
-            error:
-              data.error_description ||
-              data.error ||
-              "Token exchange failed"
-          });
       }
 
-      return res.json(data);
+      const tokenPayload =
+        userToken
+          ? parseJwt(userToken)
+          : null;
+
+      const userSub =
+        tokenPayload?.sub ||
+        "anonymous";
+
+      const result =
+        await conversationService
+          .getConversationBundle({
+            caseId,
+            userSub,
+            limit: 50
+          });
+
+      return res.json({
+        success: true,
+
+        orbitConversationId:
+          result.orbitConversationId,
+
+        conversation:
+          result.conversation || null,
+
+        messages:
+          result.messages || [],
+
+        latestResponseId:
+          result.conversation
+            ?.latestResponseId || null
+      });
 
     } catch (err) {
+
       console.error(
-        "PKCE exchange failed:",
+        "💥 Failed loading conversation:",
         err
       );
 
-      return res
-        .status(500)
-        .json({
-          error:
-            "PKCE exchange failed"
-        });
+      return res.status(500).json({
+        error:
+          "Failed loading conversation"
+      });
     }
   }
 );
 
 app.post(
-  "/auth/refresh",
+  "/chat",
 
-  async function authRefreshHandler(
+  async function chatHandler(
     req,
     res
   ) {
+
+    console.log("🔥 /chat hit");
+
+    // Declared in function scope so the catch block can clear it too.
+    let keepAlive = null;
+
     try {
-      const refreshToken =
+
+      const prompt =
         req.body &&
-        req.body.refreshToken
-          ? req.body.refreshToken
+        req.body.prompt
+          ? String(req.body.prompt)
+          : "";
+
+      const caseId =
+        req.body &&
+        req.body.caseId
+          ? String(req.body.caseId).trim()
+          : "UNKNOWN_CASE";
+
+      const fresh =
+        Boolean(
+          req.body &&
+          req.body.fresh
+        );
+
+      const userToken =
+        req.body &&
+        req.body.userToken
+          ? req.body.userToken
           : null;
 
-      if (!refreshToken) {
-        return res
-          .status(400)
-          .json({
-            error:
-              "Missing refresh token"
-          });
+      if (!prompt) {
+        return res.status(400).json({
+          error: "Prompt required"
+        });
       }
 
-      const body =
-        new URLSearchParams({
-          grant_type:
-            "refresh_token",
+      /* ---------- USER ---------- */
 
-          client_id:
-            process.env
-              .OKTA_NATIVE_CLIENT_ID,
+      const tokenPayload =
+        userToken
+          ? parseJwt(userToken)
+          : null;
 
-          refresh_token:
-            refreshToken
-        });
+      const userSub =
+        tokenPayload?.sub ||
+        "anonymous";
 
-      const response = await fetch(
-        "https://adobe-stage.okta.com/oauth2/v1/token",
-        {
-          method: "POST",
+      const userDisplayName =
+        tokenPayload?.name || "";
 
-          headers: {
-            "Content-Type":
-              "application/x-www-form-urlencoded",
+      const userEmail =
+        tokenPayload?.email || "";
 
-            Accept:
-              "application/json"
-          },
+      const userEmailHash =
+        userEmail
+          ? crypto
+              .createHash("sha256")
+              .update(userEmail)
+              .digest("hex")
+          : "";
 
-          body: body.toString()
-        }
+      /* ---------- CONVERSATION ---------- */
+
+      const {
+        conversation,
+        created
+      } =
+        await conversationService
+          .findOrCreateConversation({
+            caseId,
+            userSub,
+            userDisplayName,
+            userEmailHash
+          });
+
+      const orbitConversationId =
+        conversation
+          .orbitConversationId;
+
+      const previousResponseId =
+        fresh
+          ? null
+          : conversation
+              ?.latestResponseId || null;
+
+      console.log(
+        "🧠 orbitConversationId:",
+        orbitConversationId
       );
 
-      const data =
-        await response.json();
+      console.log(
+        "🆕 Conversation created:",
+        created
+      );
+
+      const useThread =
+        Boolean(previousResponseId) &&
+        !fresh;
+
+      const contextMode =
+        useThread
+          ? "mongo-thread"
+          : "fresh";
+
+      /* ---------- SERVICE TOKEN ---------- */
+
+      const serviceToken =
+        await getServiceToken();
+
+      /* ---------- PAYLOAD ---------- */
+
+      const payload = {
+        model: MODEL,
+
+        messages: [
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+
+        canvasMode: false,
+
+        reasoningEffort:
+          "medium",
+
+        webSearchEnabled: true
+      };
+
+      if (useThread) {
+        payload.previousResponseId =
+          previousResponseId;
+      }
+
+      /* ---------- HEADERS ---------- */
+
+      const upstreamHeaders = {
+        Authorization:
+          "Bearer " +
+          serviceToken,
+
+        Accept:
+          "text/event-stream",
+
+        "Content-Type":
+          "application/json"
+      };
+
+      console.log(
+        "📤 Context mode:",
+        contextMode
+      );
+
+      console.log(
+        "📤 Payload:",
+        JSON.stringify(
+          payload,
+          null,
+          2
+        )
+      );
+
+      /* ---------- STORE USER MESSAGE ---------- */
+
+      await conversationService
+        .appendMessage({
+          orbitConversationId,
+          caseId,
+          userSub,
+          role: "user",
+          content: prompt
+        });
+
+      /* ---------- FLUFFYJAWS ---------- */
+
+      const response =
+        await fetch(
+          BASE_URL +
+            "/api/v1/stream",
+          {
+            method: "POST",
+
+            headers:
+              upstreamHeaders,
+
+            body:
+              JSON.stringify(
+                payload
+              )
+          }
+        );
 
       if (!response.ok) {
+
+        let upstreamError =
+          "Upstream failed";
+
+        try {
+
+          const upstreamBody =
+            await response.json();
+
+          if (
+            upstreamBody &&
+            upstreamBody.error
+          ) {
+            upstreamError =
+              upstreamBody.error;
+          }
+
+        } catch (parseError) {
+
+          upstreamError =
+            "Upstream failed with HTTP " +
+            response.status;
+        }
+
         return res
           .status(response.status)
           .json({
             error:
-              data.error_description ||
-              data.error ||
-              "Refresh failed"
+              upstreamError
           });
       }
 
-      return res.json(data);
-
-    } catch (err) {
-      console.error(
-        "Refresh flow failed:",
-        err
-      );
-
-      return res
-        .status(500)
-        .json({
+      if (!response.body) {
+        return res.status(502).json({
           error:
-            "Refresh flow failed"
+            "Missing upstream response body"
         });
-    }
-  }
-);
+      }
 
-app.post("/chat", async function chatHandler(req, res) {
-  console.log("🔥 /chat hit");
+      /* ---------- KEEP-ALIVE ---------- */
+      // The upstream AI call can take longer than a fronting proxy's
+      // idle timeout (~60s). Until we have the final JSON we periodically
+      // write a newline so the proxy sees an active connection and does
+      // not return 502. JSON.parse ignores leading whitespace, so the
+      // client's response.json() still parses the final body correctly.
 
-  try {
-    const prompt = req.body && req.body.prompt ? req.body.prompt : "";
-    const previousResponseId = req.body && req.body.previousResponseId ? req.body.previousResponseId : null;
-    const history = req.body && Array.isArray(req.body.history) ? req.body.history : [];
-    const fresh = Boolean(req.body && req.body.fresh);
-    const userToken = req.body && req.body.userToken ? req.body.userToken : null;
+      res.setHeader("Content-Type", "application/json");
 
-    if (!prompt) {
-      return res.status(400).json({ error: "Prompt required" });
-    }
-
-    const normalizedHistory = normalizeHistory(history);
-    const useThread = Boolean(previousResponseId) && !fresh;
-    const contextMode = useThread ? "thread" : normalizedHistory.length > 0 && !fresh ? "history-fallback" : "fresh";
-
-    const serviceToken = await getServiceToken();
-
-    const payload = {
-      model: MODEL,
-      messages: buildMessages(prompt, normalizedHistory, previousResponseId, fresh),
-      canvasMode: false,
-      reasoningEffort: "medium",
-      webSearchEnabled: true
-    };
-
-    if (useThread) {
-      payload.previousResponseId = previousResponseId;
-    }
-
-    const upstreamHeaders = {
-      Authorization: "Bearer " + serviceToken,
-      Accept: "text/event-stream",
-      "Content-Type": "application/json"
-    };
-
-    // if (userToken) {
-    //   upstreamHeaders["X-User-Token"] = "Bearer " + userToken;
-    // }
-
-    console.log("📤 Context mode:", contextMode);
-    console.log("📤 Payload:", JSON.stringify(payload, null, 2));
-
-    const response = await fetch(BASE_URL + "/api/v1/stream", {
-      method: "POST",
-      headers: upstreamHeaders,
-      body: JSON.stringify(payload)
-    });
-
-    if (!response.ok) {
-      let upstreamError = "Upstream failed";
-
-      try {
-        const upstreamBody = await response.json();
-        if (upstreamBody && upstreamBody.error) {
-          upstreamError = upstreamBody.error;
+      keepAlive = setInterval(function sendHeartbeat() {
+        try {
+          res.write("\n");
+        } catch (_) {
+          /* connection already closed */
         }
-      } catch (parseError) {
-        upstreamError = "Upstream failed with HTTP " + response.status;
-      }
+      }, 15000);
 
-      return res.status(response.status).json({ error: upstreamError });
-    }
+      /* ---------- STREAM ---------- */
 
-    if (!response.body) {
-      return res.status(502).json({ error: "Missing upstream response body" });
-    }
+      const reader =
+        response.body.getReader();
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
+      const decoder =
+        new TextDecoder();
 
-    const bufferObj = { buffer: "" };
-    let finalText = "";
-    let responseId = null;
-    let terminalError = null;
-    let streamDone = false;
+      const bufferObj = {
+        buffer: ""
+      };
 
-    while (!streamDone) {
-      const chunkResult = await reader.read();
+      let finalText = "";
 
-      if (chunkResult.done) {
-        break;
-      }
+      let responseId = null;
 
-      const chunk = decoder.decode(chunkResult.value, { stream: true });
-      const events = parseSSE(chunk, bufferObj);
+      let terminalError = null;
 
-      for (let i = 0; i < events.length; i += 1) {
-        const data = events[i];
+      let streamDone = false;
 
-        if (data === "[DONE]") {
-          streamDone = true;
+      while (!streamDone) {
+
+        const chunkResult =
+          await reader.read();
+
+        if (chunkResult.done) {
           break;
         }
 
-        try {
-          const obj = JSON.parse(data);
-          console.log("EVENT:", obj.type);
+        const chunk =
+          decoder.decode(
+            chunkResult.value,
+            { stream: true }
+          );
 
-          if (obj.type === "response.created" && obj.response && obj.response.id) {
-            responseId = obj.response.id;
-          }
+        const events =
+          parseSSE(
+            chunk,
+            bufferObj
+          );
 
-          if (obj.type === "response.completed" && obj.response && obj.response.id) {
-            responseId = obj.response.id;
-          }
+        for (
+          let i = 0;
+          i < events.length;
+          i += 1
+        ) {
 
-          if (obj.type === "response.output_text.delta" && obj.delta) {
-            finalText += obj.delta;
-          }
+          const data =
+            events[i];
 
-          if (obj.type === "response.output_text.done" && typeof obj.text === "string" && obj.text && !finalText) {
-            finalText = obj.text;
-          }
-
-          if (obj.type === "response.failed") {
-            terminalError = obj.error && obj.error.message ? obj.error.message : "Response failed";
+          if (data === "[DONE]") {
             streamDone = true;
             break;
           }
 
-          if (obj.type === "error") {
-            terminalError = obj.message || "Upstream error";
-            streamDone = true;
-            break;
+          try {
+
+            const obj =
+              JSON.parse(data);
+
+            console.log(
+              "EVENT:",
+              obj.type
+            );
+
+            if (
+              obj.type ===
+                "response.created" &&
+              obj.response &&
+              obj.response.id
+            ) {
+              responseId =
+                obj.response.id;
+            }
+
+            if (
+              obj.type ===
+                "response.completed" &&
+              obj.response &&
+              obj.response.id
+            ) {
+              responseId =
+                obj.response.id;
+            }
+
+            if (
+              obj.type ===
+                "response.output_text.delta" &&
+              obj.delta
+            ) {
+              finalText +=
+                obj.delta;
+            }
+
+            if (
+              obj.type ===
+                "response.output_text.done" &&
+              typeof obj.text ===
+                "string" &&
+              obj.text &&
+              !finalText
+            ) {
+              finalText =
+                obj.text;
+            }
+
+            if (
+              obj.type ===
+              "response.failed"
+            ) {
+
+              terminalError =
+                obj.error &&
+                obj.error.message
+                  ? obj.error.message
+                  : "Response failed";
+
+              streamDone = true;
+
+              break;
+            }
+
+            if (
+              obj.type === "error"
+            ) {
+
+              terminalError =
+                obj.message ||
+                "Upstream error";
+
+              streamDone = true;
+
+              break;
+            }
+
+          } catch (parseError) {
+
+            console.warn(
+              "⚠️ Failed to parse SSE event:",
+              data
+            );
           }
-        } catch (parseError) {
-          console.warn("⚠️ Failed to parse SSE event:", data);
         }
       }
-    }
 
-    if (terminalError) {
-      console.error("❌ Stream error:", terminalError);
-      return res.status(502).json({
-        error: terminalError,
-        responseId: responseId || null
+      /* ---------- TERMINAL ERROR ---------- */
+
+      if (terminalError) {
+
+        clearInterval(keepAlive);
+
+        console.error(
+          "❌ Stream error:",
+          terminalError
+        );
+
+        const errorBody = JSON.stringify({
+          error: terminalError,
+          responseId: responseId || null
+        });
+
+        // Once the heartbeat has flushed headers we can no longer set a
+        // status code, so finish the already-open response with res.end.
+        if (res.headersSent) {
+          return res.end(errorBody);
+        }
+
+        return res.status(502).json({
+          error: terminalError,
+          responseId:
+            responseId || null
+        });
+      }
+
+      console.log(
+        "📤 Final:",
+        finalText
+      );
+
+      console.log(
+        "🆔 responseId:",
+        responseId
+      );
+
+      /* ---------- STORE ASSISTANT ---------- */
+
+      await conversationService
+        .appendMessage({
+          orbitConversationId,
+          caseId,
+          userSub,
+          role: "assistant",
+          content: finalText,
+          responseId
+        });
+
+      /* ---------- UPDATE CONTINUITY ---------- */
+
+      await conversationService
+        .updateLatestResponseId({
+          orbitConversationId,
+          latestResponseId:
+            responseId
+        });
+
+      /* ---------- RESPONSE ---------- */
+
+      clearInterval(keepAlive);
+
+      const successBody = JSON.stringify({
+        text: finalText,
+        responseId: responseId || null,
+        contextMode,
+        orbitConversationId
+      });
+
+      if (res.headersSent) {
+        return res.end(successBody);
+      }
+
+      return res.json({
+        text: finalText,
+
+        responseId:
+          responseId || null,
+
+        contextMode:
+          contextMode,
+
+        orbitConversationId
+      });
+
+    } catch (err) {
+
+      clearInterval(keepAlive);
+
+      console.error(
+        "💥 Server error:",
+        err
+      );
+
+      if (res.headersSent) {
+        return res.end(
+          JSON.stringify({ error: "Server error" })
+        );
+      }
+
+      return res.status(500).json({
+        error: "Server error"
       });
     }
-
-    console.log("📤 Final:", finalText);
-    console.log("🆔 responseId:", responseId);
-
-    return res.json({
-      text: finalText,
-      responseId: responseId || null,
-      contextMode: contextMode
-    });
-  } catch (err) {
-    console.error("💥 Server error:", err);
-    return res.status(500).json({ error: "Server error" });
   }
-});
+);
 
 app.get("/health", function healthHandler(req, res) {
-  return res.status(200).json({
-    status: "ok",
-    service: "orbit-backend",
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || "development"
-  });
+    return res.status(200).json({
+        status: "ok",
+        service: "orbit-backend",
+        uptime: process.uptime(),
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || "development"
+    });
 });
 
 async function startServer() {
 
-  try {
+    try {
 
-    await connectDB();
+        await connectDB();
 
-    app.listen(
-      PORT,
-      function onListen() {
+        app.listen(
+            PORT,
+            function onListen() {
 
-        console.log(
-          "🚀 Server running on http://localhost:" + PORT
+                console.log(
+                    "🚀 Server running on http://localhost:" + PORT
+                );
+
+            }
         );
 
-      }
-    );
+    } catch (err) {
 
-  } catch (err) {
+        console.error(
+            "💥 Failed to start backend:",
+            err
+        );
 
-    console.error(
-      "💥 Failed to start backend:",
-      err
-    );
-
-    process.exit(1);
-  }
+        process.exit(1);
+    }
 }
 
 startServer();

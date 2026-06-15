@@ -430,6 +430,9 @@ app.post(
 
     console.log("🔥 /chat hit");
 
+    // Declared in function scope so the catch block can clear it too.
+    let keepAlive = null;
+
     try {
 
       const prompt =
@@ -574,6 +577,10 @@ app.post(
           "application/json"
       };
 
+      if (userToken) {
+        upstreamHeaders["X-User-Token"] = "Bearer " + userToken;
+      }
+
       console.log(
         "📤 Context mode:",
         contextMode
@@ -657,6 +664,23 @@ app.post(
             "Missing upstream response body"
         });
       }
+
+      /* ---------- KEEP-ALIVE ---------- */
+      // The upstream AI call can take longer than a fronting proxy's
+      // idle timeout (~60s). Until we have the final JSON we periodically
+      // write a newline so the proxy sees an active connection and does
+      // not return 502. JSON.parse ignores leading whitespace, so the
+      // client's response.json() still parses the final body correctly.
+
+      res.setHeader("Content-Type", "application/json");
+
+      keepAlive = setInterval(function sendHeartbeat() {
+        try {
+          res.write("\n");
+        } catch (_) {
+          /* connection already closed */
+        }
+      }, 15000);
 
       /* ---------- STREAM ---------- */
 
@@ -807,10 +831,23 @@ app.post(
 
       if (terminalError) {
 
+        clearInterval(keepAlive);
+
         console.error(
           "❌ Stream error:",
           terminalError
         );
+
+        const errorBody = JSON.stringify({
+          error: terminalError,
+          responseId: responseId || null
+        });
+
+        // Once the heartbeat has flushed headers we can no longer set a
+        // status code, so finish the already-open response with res.end.
+        if (res.headersSent) {
+          return res.end(errorBody);
+        }
 
         return res.status(502).json({
           error: terminalError,
@@ -852,6 +889,19 @@ app.post(
 
       /* ---------- RESPONSE ---------- */
 
+      clearInterval(keepAlive);
+
+      const successBody = JSON.stringify({
+        text: finalText,
+        responseId: responseId || null,
+        contextMode,
+        orbitConversationId
+      });
+
+      if (res.headersSent) {
+        return res.end(successBody);
+      }
+
       return res.json({
         text: finalText,
 
@@ -866,10 +916,18 @@ app.post(
 
     } catch (err) {
 
+      clearInterval(keepAlive);
+
       console.error(
         "💥 Server error:",
         err
       );
+
+      if (res.headersSent) {
+        return res.end(
+          JSON.stringify({ error: "Server error" })
+        );
+      }
 
       return res.status(500).json({
         error: "Server error"

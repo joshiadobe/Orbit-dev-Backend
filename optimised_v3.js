@@ -21,7 +21,7 @@ app.use(function addHeaders(req, res, next) {
 });
 
 app.use(cors({ origin: true }));
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 const BASE_URL = process.env.FJ_BASE_URL || "https://api.fluffyjaws.adobe.com";
 const MODEL = process.env.FJ_MODEL || "gpt-5.4";
@@ -459,6 +459,29 @@ app.post(
           ? req.body.userToken
           : null;
 
+      const attachments =
+        req.body &&
+        Array.isArray(req.body.attachments)
+          ? req.body.attachments
+          : [];
+
+      const THIRTY_MB = 30 * 1024 * 1024;
+
+      const totalAttachmentSize =
+        attachments.reduce((sum, att) => {
+          if (!att.fileData) return sum;
+          const base64 = att.fileData.includes(",")
+            ? att.fileData.split(",")[1]
+            : att.fileData;
+          return sum + Math.ceil(base64.length * 0.75);
+        }, 0);
+
+      if (totalAttachmentSize > THIRTY_MB) {
+        return res.status(400).json({
+          error: "Total attachment size exceeds 30MB limit"
+        });
+      }
+
       if (!prompt) {
         return res.status(400).json({
           error: "Prompt required"
@@ -540,13 +563,26 @@ app.post(
 
       /* ---------- PAYLOAD ---------- */
 
+      const messageContent =
+        attachments.length > 0
+          ? [
+              { type: "input_text", text: prompt },
+              ...attachments.map(att => ({
+                type: "input_file",
+                filename: att.fileName,
+                file_data: att.fileData,
+                mime_type: att.mimeType || undefined
+              }))
+            ]
+          : prompt;
+
       const payload = {
         model: MODEL,
 
         messages: [
           {
             role: "user",
-            content: prompt
+            content: messageContent
           }
         ],
 

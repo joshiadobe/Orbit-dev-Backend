@@ -708,15 +708,27 @@ app.post(
       // not return 502. JSON.parse ignores leading whitespace, so the
       // client's response.json() still parses the final body correctly.
 
-      res.setHeader("Content-Type", "application/json");
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("X-Accel-Buffering", "no");
 
       keepAlive = setInterval(function sendHeartbeat() {
         try {
-          res.write("\n");
+          res.write(": heartbeat\n\n");
         } catch (_) {
           /* connection already closed */
         }
       }, 15000);
+
+      let lastStatusPhase = null;
+
+      function emitStatus(phase, message) {
+        if (phase === lastStatusPhase) return;
+        lastStatusPhase = phase;
+        try {
+          res.write("data: " + JSON.stringify({ type: "status", message }) + "\n\n");
+        } catch (_) {}
+      }
 
       /* ---------- STREAM ---------- */
 
@@ -782,6 +794,18 @@ app.post(
               "EVENT:",
               obj.type
             );
+
+            if (obj.type === "response.created") {
+              emitStatus("created", "🔍 Connected to FluffyJaws...");
+            } else if (obj.type === "response.reasoning_summary_text.delta") {
+              emitStatus("reasoning", "🧠 Thinking...");
+            } else if (obj.type === "response.code_interpreter_call.in_progress") {
+              emitStatus("code", "⚙️ Running analysis...");
+            } else if (obj.type === "response.code_interpreter_call.interpreting") {
+              emitStatus("interpreting", "📊 Interpreting results...");
+            } else if (obj.type === "response.output_text.delta") {
+              emitStatus("writing", "✍️ Writing response...");
+            }
 
             if (
               obj.type ===
@@ -874,22 +898,20 @@ app.post(
           terminalError
         );
 
-        const errorBody = JSON.stringify({
-          error: terminalError,
-          responseId: responseId || null
-        });
+        const errorEvent =
+          "data: " + JSON.stringify({
+            type: "error",
+            error: terminalError,
+            responseId: responseId || null
+          }) + "\n\ndata: [DONE]\n\n";
 
-        // Once the heartbeat has flushed headers we can no longer set a
-        // status code, so finish the already-open response with res.end.
         if (res.headersSent) {
-          return res.end(errorBody);
+          return res.end(errorEvent);
         }
 
-        return res.status(502).json({
-          error: terminalError,
-          responseId:
-            responseId || null
-        });
+        res.setHeader("Content-Type", "text/event-stream");
+        res.write(errorEvent);
+        return res.end();
       }
 
       console.log(
@@ -927,28 +949,16 @@ app.post(
 
       clearInterval(keepAlive);
 
-      const successBody = JSON.stringify({
-        text: finalText,
-        responseId: responseId || null,
-        contextMode,
-        orbitConversationId
-      });
-
-      if (res.headersSent) {
-        return res.end(successBody);
-      }
-
-      return res.json({
-        text: finalText,
-
-        responseId:
-          responseId || null,
-
-        contextMode:
+      const resultEvent =
+        "data: " + JSON.stringify({
+          type: "result",
+          text: finalText,
+          responseId: responseId || null,
           contextMode,
+          orbitConversationId
+        }) + "\n\ndata: [DONE]\n\n";
 
-        orbitConversationId
-      });
+      return res.end(resultEvent);
 
     } catch (err) {
 

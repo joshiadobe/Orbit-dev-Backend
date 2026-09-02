@@ -24,6 +24,9 @@ app.use(cors({ origin: true }));
 app.use(express.json({ limit: "50mb" }));
 
 const BASE_URL = process.env.FJ_BASE_URL || "https://api.fluffyjaws.adobe.com";
+// Status endpoint lives on the same API host by default. Override with
+// FJ_STATUS_BASE_URL if the status service is exposed on a different host.
+const FJ_STATUS_BASE_URL = process.env.FJ_STATUS_BASE_URL || BASE_URL;
 const MODEL = process.env.FJ_MODEL || "gpt-5.4";
 const PORT = process.env.PORT || 3000;
 const OKTA_OIDC_ISSUER =
@@ -980,6 +983,75 @@ app.post(
       });
     }
   }
+);
+
+app.get(
+    "/status/:service",
+
+    async function statusHandler(req, res) {
+        try {
+            const service =
+                req.params && req.params.service
+                    ? String(req.params.service).trim()
+                    : "";
+
+            if (!service) {
+                return res.status(400).json({
+                    error: "service required"
+                });
+            }
+
+            // Server-side call to fluffyjaws using the Okta service token.
+            // This avoids the extension hitting the Banyan-gated web host
+            // directly (which 302-redirects to auth and fails CORS).
+            const serviceToken = await getServiceToken();
+
+            const upstreamUrl =
+                FJ_STATUS_BASE_URL +
+                "/api/status/" +
+                encodeURIComponent(service);
+
+            const response = await fetch(upstreamUrl, {
+                method: "GET",
+                headers: {
+                    Authorization: "Bearer " + serviceToken,
+                    Accept: "application/json"
+                }
+            });
+
+            const rawBody = await response.text();
+
+            let data;
+
+            try {
+                data = rawBody ? JSON.parse(rawBody) : {};
+            } catch (parseError) {
+                console.error(
+                    "Status upstream returned non-JSON (HTTP " +
+                        response.status +
+                        ") from " +
+                        upstreamUrl +
+                        ":",
+                    rawBody.slice(0, 200)
+                );
+
+                return res.status(502).json({
+                    error: "Status upstream returned a non-JSON response"
+                });
+            }
+
+            // Pass the upstream status + body straight through so the
+            // extension keeps reading { activeIssueCount, warning, message }.
+            return res.status(response.status).json(data);
+
+        } catch (err) {
+            console.error("Status check failed:", err);
+
+            return res.status(500).json({
+                error: "Status check failed"
+            });
+        }
+    }
 );
 
 app.get("/health", function healthHandler(req, res) {
